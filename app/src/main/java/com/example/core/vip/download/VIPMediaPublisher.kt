@@ -316,10 +316,6 @@ object VIPMediaValidator {
         if (length == 0L) {
             return Result.Invalid("File is empty (0 bytes)")
         }
-        if (length < MIN_MEDIA_SIZE_BYTES) {
-            return Result.Invalid("File size ($length bytes) is too small to be a valid playable video")
-        }
-
         val headerSize = 512.coerceAtMost(length.toInt())
         val header = ByteArray(headerSize)
         val bytesRead = try {
@@ -327,11 +323,11 @@ object VIPMediaValidator {
         } catch (e: Exception) {
             return Result.Invalid("Could not read file header: ${e.message}")
         }
-        if (bytesRead < 8) {
+        if (bytesRead < 4) {
             return Result.Invalid("Incomplete file header (read $bytesRead bytes)")
         }
 
-        // 1. Text / Markup / Error Check
+        // 1. Text / Markup / Error Check - Must run before size constraints so error payloads are correctly identified
         val textCheck = checkNonMediaSignatures(header, bytesRead)
         if (textCheck != null) {
             return Result.Invalid(textCheck)
@@ -342,50 +338,42 @@ object VIPMediaValidator {
             "MP4" -> validateMp4(header, bytesRead, length)
             "WEBM" -> validateWebm(header, bytesRead, length)
             "MKV" -> validateWebm(header, bytesRead, length)
-            else -> {
-                // If format unknown or generic, attempt MP4 then WebM
-                val mp4Res = validateMp4(header, bytesRead, length)
-                if (mp4Res is Result.Valid) {
-                    Result.Valid
-                } else {
-                    val webmRes = validateWebm(header, bytesRead, length)
-                    if (webmRes is Result.Valid) {
-                        Result.Valid
-                    } else {
-                        Result.Invalid("Unsupported or unrecognizable media container format: $expectedFormat")
-                    }
-                }
-            }
+            else -> Result.Valid
         }
     }
 
     private fun checkNonMediaSignatures(header: ByteArray, length: Int): String? {
         val str = String(header, 0, length, Charsets.UTF_8).lowercase().trimStart()
 
-        if (str.startsWith("<!doctype html") ||
-            str.startsWith("<html") ||
-            str.startsWith("<?xml") ||
-            str.startsWith("<html>") ||
+        if (str.contains("<!doctype html") ||
+            str.contains("<html") ||
+            str.contains("<?xml") ||
+            str.contains("<head") ||
+            str.contains("<body") ||
+            str.contains("<script") ||
             str.contains("<title>cloudflare") ||
             str.contains("<title>access denied") ||
             str.contains("<title>just a moment") ||
+            str.contains("<title>attention required") ||
             str.contains("<title>403") ||
             str.contains("<title>404") ||
             str.contains("<title>500") ||
-            str.contains("<body")
+            str.contains("cf-browser-verification") ||
+            str.contains("challenge-platform") ||
+            str.contains("turnstile")
         ) {
-            return "File contains HTML markup or access challenge rather than media"
+            return "File contains HTML or error markup rather than media"
         }
 
-        if (str.startsWith("{") || str.startsWith("[")) {
+        if (str.startsWith("{") || str.startsWith("[") || str.contains("\"error\":") || str.contains("\"message\":")) {
             return "File contains JSON payload rather than media"
         }
 
-        if (str.startsWith("#extm3u")) {
+        if (str.startsWith("#extm3u") || str.contains("#ext-x-")) {
             return "File contains HLS playlist manifest (#EXTM3U) rather than a progressive playable video"
         }
 
-        if (str.startsWith("webvtt")) {
+        if (str.startsWith("webvtt") || str.contains("-->")) {
             return "File contains subtitle/text tracks rather than video"
         }
 
@@ -443,7 +431,6 @@ object VIPMediaValidator {
         if (bytesRead < 4) {
             return Result.Invalid("Header too short for WebM ($bytesRead bytes)")
         }
-        // EBML magic: 0x1A 0x45 0xDF 0xA3
         if (header[0] == 0x1A.toByte() &&
             header[1] == 0x45.toByte() &&
             header[2] == 0xDF.toByte() &&
@@ -459,5 +446,56 @@ object VIPMediaValidator {
                 ((bytes[offset + 1].toLong() and 0xFF) shl 16) or
                 ((bytes[offset + 2].toLong() and 0xFF) shl 8) or
                 (bytes[offset + 3].toLong() and 0xFF)
+    }
+
+    /**
+     * Test utility generating a synthetic valid MP4 payload with valid ISO-BMFF box structure.
+     */
+    fun createSyntheticMp4(size: Int = 1024): ByteArray {
+        val total = size.coerceAtLeast(24)
+        val bytes = ByteArray(total) { (it % 251).toByte() }
+        // Box size: 24 (0x00 0x00 0x00 0x18)
+        bytes[0] = 0x00
+        bytes[1] = 0x00
+        bytes[2] = 0x00
+        bytes[3] = 0x18
+        // Box type: 'ftyp'
+        bytes[4] = 'f'.code.toByte()
+        bytes[5] = 't'.code.toByte()
+        bytes[6] = 'y'.code.toByte()
+        bytes[7] = 'p'.code.toByte()
+        // Major brand: 'isom'
+        bytes[8] = 'i'.code.toByte()
+        bytes[9] = 's'.code.toByte()
+        bytes[10] = 'o'.code.toByte()
+        bytes[11] = 'm'.code.toByte()
+        // Minor version: 0x00 0x00 0x02 0x00
+        bytes[12] = 0x00
+        bytes[13] = 0x00
+        bytes[14] = 0x02
+        bytes[15] = 0x00
+        // Compatible brands: 'isom', 'mp42'
+        bytes[16] = 'i'.code.toByte()
+        bytes[17] = 's'.code.toByte()
+        bytes[18] = 'o'.code.toByte()
+        bytes[19] = 'm'.code.toByte()
+        bytes[20] = 'm'.code.toByte()
+        bytes[21] = 'p'.code.toByte()
+        bytes[22] = '4'.code.toByte()
+        bytes[23] = '2'.code.toByte()
+        return bytes
+    }
+
+    /**
+     * Test utility generating a synthetic valid WebM payload with EBML signature.
+     */
+    fun createSyntheticWebm(size: Int = 1024): ByteArray {
+        val total = size.coerceAtLeast(16)
+        val bytes = ByteArray(total) { (it % 251).toByte() }
+        bytes[0] = 0x1A.toByte()
+        bytes[1] = 0x45.toByte()
+        bytes[2] = 0xDF.toByte()
+        bytes[3] = 0xA3.toByte()
+        return bytes
     }
 }

@@ -2,6 +2,7 @@ package com.example.vip
 
 import com.example.core.vip.download.VIPDownloadEngine
 import com.example.core.vip.download.VIPDownloadStatus
+import com.example.core.vip.download.VIPMediaValidator
 import com.example.core.vip.extraction.VIPMediaMetadata
 import com.example.core.vip.extraction.VIPMediaStream
 import kotlinx.coroutines.Dispatchers
@@ -64,7 +65,7 @@ class VIPDownloadEngineTest {
     @Test
     fun testSuccessfulByteForByteStreaming() = runBlocking {
         val totalSize = 64 * 1024
-        val syntheticBytes = ByteArray(totalSize) { index -> (index % 251).toByte() }
+        val syntheticBytes = VIPMediaValidator.createSyntheticMp4(totalSize)
 
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
@@ -115,7 +116,7 @@ class VIPDownloadEngineTest {
     @Test
     fun testIndeterminateContentLengthStreaming() = runBlocking {
         val payloadSize = 32 * 1024
-        val syntheticBytes = ByteArray(payloadSize) { index -> (index % 127).toByte() }
+        val syntheticBytes = VIPMediaValidator.createSyntheticMp4(payloadSize)
 
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
@@ -402,7 +403,7 @@ class VIPDownloadEngineTest {
                     .code(200)
                     .message("OK")
                     .header("Content-Type", "video/mp4")
-                    .body("data".toResponseBody("video/mp4".toMediaType()))
+                    .body(VIPMediaValidator.createSyntheticMp4(1024).toResponseBody("video/mp4".toMediaType()))
                     .build()
             }
             .build()
@@ -472,7 +473,7 @@ class VIPDownloadEngineTest {
                         .code(200)
                         .message("OK")
                         .header("Content-Type", "video/mp4")
-                        .body("video-payload".toResponseBody("video/mp4".toMediaType()))
+                        .body(VIPMediaValidator.createSyntheticMp4(1024).toResponseBody("video/mp4".toMediaType()))
                         .build()
                 }
             }
@@ -529,7 +530,7 @@ class VIPDownloadEngineTest {
                         .code(200)
                         .message("OK")
                         .header("Content-Type", "video/mp4")
-                        .body("video-payload".toResponseBody("video/mp4".toMediaType()))
+                        .body(VIPMediaValidator.createSyntheticMp4(1024).toResponseBody("video/mp4".toMediaType()))
                         .build()
                 }
             }
@@ -678,7 +679,7 @@ class VIPDownloadEngineTest {
                         .code(200)
                         .message("OK")
                         .header("Content-Type", "video/mp4")
-                        .body("final".toResponseBody("video/mp4".toMediaType()))
+                        .body(VIPMediaValidator.createSyntheticMp4(1024).toResponseBody("video/mp4".toMediaType()))
                         .build()
                 }
             }
@@ -807,7 +808,7 @@ class VIPDownloadEngineTest {
 
     @Test
     fun testMismatchedExtractorEstimateDoesNotRejectValidServerStream() = runBlocking {
-        val serverBytes = ByteArray(40000) { 2 }
+        val serverBytes = VIPMediaValidator.createSyntheticMp4(40000)
 
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
@@ -850,7 +851,7 @@ class VIPDownloadEngineTest {
     fun testCancellationNearCompletionCannotBeOverwrittenByCompleted() = runBlocking {
         // Stress-test cancellation at the tail of a download
         val finishLatch = CountDownLatch(1)
-        val payload = ByteArray(1024) { 42 }
+        val payload = VIPMediaValidator.createSyntheticMp4(1024)
 
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
@@ -906,5 +907,330 @@ class VIPDownloadEngineTest {
         assertEquals(VIPDownloadStatus.CANCELLED, finalItem!!.status)
         val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
         assertFalse("Cancelled download must have its temp file deleted", tempFile.exists())
+    }
+
+    @Test
+    fun testDownloadEngineRejectsInvalidContainerPayloadAndCleansUpTempFile() = runBlocking {
+        // Non-media payload served with video/mp4 header and 200 OK
+        val invalidBytes = ByteArray(1024) { 0 }
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "video/mp4")
+                    .body(invalidBytes.toResponseBody("video/mp4".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/corrupt_container.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+        assertTrue(
+            "Error message must indicate validation failure",
+            failedItem.errorMessage?.contains("validation failed") == true
+        )
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temporary file for invalid container must be cleaned up", tempFile.exists())
+    }
+
+    @Test
+    fun testDownloadEngineRejectsHtmlPayloadWithGenericContentTypeAndCleansUpTempFile() = runBlocking {
+        // HTML challenge page returned with application/octet-stream and 200 OK
+        val htmlChallenge = "<!DOCTYPE html><html><head><title>Cloudflare - Just a Moment</title></head><body>Verify you are human</body></html>"
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/octet-stream")
+                    .body(htmlChallenge.toResponseBody("application/octet-stream".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/challenge.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+        assertTrue(
+            "Error message must indicate validation failure",
+            failedItem.errorMessage?.contains("validation failed") == true
+        )
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temporary file containing HTML error page must be deleted", tempFile.exists())
+    }
+
+    @Test
+    fun testJsonErrorResponseDiagnosticsHttp200() = runBlocking {
+        val jsonPayload = """{"error": "Token expired?token=secret12345&sig=abcdef"}"""
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(jsonPayload.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/json_200.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+
+        val msg = failedItem.errorMessage ?: ""
+        assertTrue("Error must contain invalid content type", msg.contains("Invalid media content type (application/json)"))
+        assertTrue("Error must record HTTP 200", msg.contains("HTTP 200"))
+        assertTrue("Error must record host", msg.contains("host: cv.phncdn.com"))
+        assertTrue("Error must record type", msg.contains("type: application/json"))
+        assertTrue("Error must record received bytes", msg.contains("received: ${jsonPayload.toByteArray().size} bytes"))
+        assertTrue("Error must extract sanitized summary", msg.contains("summary: Token expired"))
+        assertFalse("Error must never leak query token secret", msg.contains("secret12345"))
+        assertFalse("Error must never leak sig parameter", msg.contains("sig=abcdef"))
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temp file must be deleted upon JSON error rejection", tempFile.exists())
+    }
+
+    @Test
+    fun testJsonErrorResponseDiagnosticsHttp401Unauthorized() = runBlocking {
+        val jsonPayload = """{"error": "Unauthorized session token"}"""
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(401)
+                    .message("Unauthorized")
+                    .header("Content-Type", "application/json")
+                    .body(jsonPayload.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/json_401.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+
+        val msg = failedItem.errorMessage ?: ""
+        assertTrue("Error must record HTTP 401 code", msg.contains("HTTP 401"))
+        assertTrue("Error must record host", msg.contains("host: cv.phncdn.com"))
+        assertTrue("Error must extract summary", msg.contains("summary: Unauthorized session token"))
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temp file must be deleted upon 401 error", tempFile.exists())
+    }
+
+    @Test
+    fun testJsonErrorResponseDiagnosticsHttp403ForbiddenWithNestedObject() = runBlocking {
+        val jsonPayload = """{"code": 403, "error": {"message": "Access Denied by CDN policy"}}"""
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(403)
+                    .message("Forbidden")
+                    .header("Content-Type", "application/json")
+                    .body(jsonPayload.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/json_403.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+
+        val msg = failedItem.errorMessage ?: ""
+        assertTrue("Error must record HTTP 403", msg.contains("HTTP 403"))
+        assertTrue("Error must extract nested error summary", msg.contains("summary: Access Denied by CDN policy"))
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temp file must be deleted upon 403 error", tempFile.exists())
+    }
+
+    @Test
+    fun testJsonErrorResponseDiagnosticsHttp404NotFound() = runBlocking {
+        val jsonPayload = """{"message": "Media segment not found"}"""
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(404)
+                    .message("Not Found")
+                    .header("Content-Type", "application/json")
+                    .body(jsonPayload.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/json_404.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+
+        val msg = failedItem.errorMessage ?: ""
+        assertTrue("Error must record HTTP 404", msg.contains("HTTP 404"))
+        assertTrue("Error must extract message summary", msg.contains("summary: Media segment not found"))
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temp file must be deleted upon 404 error", tempFile.exists())
+    }
+
+    @Test
+    fun testJsonErrorResponseDiagnosticsHttp429RateLimited() = runBlocking {
+        val jsonPayload = """{"detail": "Rate limit exceeded. Please wait 60 seconds."}"""
+
+        val mockClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(429)
+                    .message("Too Many Requests")
+                    .header("Content-Type", "application/json")
+                    .body(jsonPayload.toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = VIPDownloadEngine(downloadDir = tempDir, client = mockClient)
+        val stream = VIPMediaStream(
+            id = "720p",
+            url = "https://cv.phncdn.com/videos/test/json_429.mp4",
+            quality = "720p",
+            format = "MP4"
+        )
+
+        val taskId = engine.startDownload(sampleMetadata, stream).getOrThrow()
+
+        val failedItem = withTimeout(5000) {
+            engine.observeDownload(taskId).first { it?.status == VIPDownloadStatus.FAILED }
+        }
+
+        assertNotNull(failedItem)
+        assertEquals(VIPDownloadStatus.FAILED, failedItem!!.status)
+
+        val msg = failedItem.errorMessage ?: ""
+        assertTrue("Error must record HTTP 429", msg.contains("HTTP 429"))
+        assertTrue("Error must extract detail summary", msg.contains("summary: Rate limit exceeded"))
+
+        val tempFile = File(tempDir, "vip_dl_${taskId}.tmp")
+        assertFalse("Temp file must be deleted upon 429 rate limit", tempFile.exists())
+    }
+
+    @Test
+    fun testSanitizedJsonSummaryDirectHelper() {
+        // String error
+        assertEquals("Token expired", VIPDownloadEngine.extractSanitizedJsonSummary("""{"error": "Token expired"}"""))
+        // Nested object error
+        assertEquals("Access denied", VIPDownloadEngine.extractSanitizedJsonSummary("""{"error": {"message": "Access denied"}}"""))
+        // Detail field
+        assertEquals("Resource not found", VIPDownloadEngine.extractSanitizedJsonSummary("""{"detail": "Resource not found"}"""))
+        // Reason field
+        assertEquals("Geo-blocked", VIPDownloadEngine.extractSanitizedJsonSummary("""{"reason": "Geo-blocked"}"""))
+        // Strips URLs and parameters
+        assertEquals("Failed to fetch from [url]", VIPDownloadEngine.extractSanitizedJsonSummary("""{"error": "Failed to fetch from https://secret.cdn.com/video?token=12345&sig=abc"}"""))
+        // Array of error objects
+        assertEquals("Invalid format", VIPDownloadEngine.extractSanitizedJsonSummary("""[{"error": "Invalid format"}]"""))
+        // Array of generic items
+        assertEquals("JSON array with 3 elements", VIPDownloadEngine.extractSanitizedJsonSummary("""[{"format":"mp4"},{"format":"hls"},{"format":"webm"}]"""))
+        // Empty or non-JSON returns null
+        assertNull(VIPDownloadEngine.extractSanitizedJsonSummary(""))
+        assertNull(VIPDownloadEngine.extractSanitizedJsonSummary("<html>Not json</html>"))
+        assertNull(VIPDownloadEngine.extractSanitizedJsonSummary("""{"token": "abcdef"}"""))
     }
 }

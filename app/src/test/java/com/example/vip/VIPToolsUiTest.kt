@@ -6,6 +6,7 @@ import com.example.core.vip.download.VIPDownloadEngine
 import com.example.core.vip.download.VIPDownloadItem
 import com.example.core.vip.download.VIPDownloadStatus
 import com.example.core.vip.download.VIPMediaPublisher
+import com.example.core.vip.download.VIPMediaValidator
 import com.example.core.vip.download.VIPPublishResult
 import com.example.core.vip.extraction.VIPExtractionManager
 import com.example.core.vip.extraction.VIPMediaMetadata
@@ -162,7 +163,7 @@ class VIPToolsUiTest {
 
     @Test
     fun testObserveDownloadStreamsProgressAndReachesCompleted() = runBlocking {
-        val payload = ByteArray(32768) { (it % 100).toByte() }
+        val payload = VIPMediaValidator.createSyntheticMp4(32768)
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 Response.Builder()
@@ -194,7 +195,7 @@ class VIPToolsUiTest {
 
     @Test
     fun testCompletedDownloadPublishesToMediaStoreViaPublisher() = runBlocking {
-        val payload = ByteArray(16384) { (it % 200).toByte() }
+        val payload = VIPMediaValidator.createSyntheticMp4(16384)
         val mockClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
                 Response.Builder()

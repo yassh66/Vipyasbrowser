@@ -82,6 +82,18 @@ class PornhubExtractor(
             return allowedSuffixes.any { cleanHost.endsWith(it) }
         }
 
+        fun isApiOrManifestUrl(url: String): Boolean {
+            if (url.isBlank()) return false
+            val clean = url.lowercase()
+            return clean.contains("/get_media") ||
+                    clean.contains("video/get_media") ||
+                    clean.contains("/api/") ||
+                    clean.contains(".json") ||
+                    clean.contains("format=json") ||
+                    clean.contains("type=json") ||
+                    clean.contains("response_type=json")
+        }
+
         private fun defaultHttpClient(): OkHttpClient {
             return OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
@@ -423,12 +435,14 @@ class PornhubExtractor(
         // Strategy 1: Find mediaDefinitions array
         val mediaDefRegex = Pattern.compile("[\"']mediaDefinitions[\"']\\s*:\\s*(\\[.*?\\])(?=[,;}\\n\\r])", Pattern.DOTALL)
         var matcher = mediaDefRegex.matcher(html)
-        if (!matcher.find()) {
+        var found = matcher.find()
+        if (!found) {
             val fallbackRegex = Pattern.compile("[\"']mediaDefinitions[\"']\\s*:\\s*(\\[\\s*\\{.*?\\}\\s*\\])", Pattern.DOTALL)
             matcher = fallbackRegex.matcher(html)
+            found = matcher.find()
         }
 
-        if (matcher.find()) {
+        if (found) {
             val jsonArrayStr = matcher.group(1)
             if (!jsonArrayStr.isNullOrBlank()) {
                 try {
@@ -440,14 +454,20 @@ class PornhubExtractor(
 
                         val isAdaptive = format == "hls" || format == "mpd" ||
                                 rawUrl.contains(".m3u8", ignoreCase = true) ||
-                                rawUrl.contains(".mpd", ignoreCase = true)
+                                rawUrl.contains(".mpd", ignoreCase = true) ||
+                                rawUrl.contains("/hls/", ignoreCase = true) ||
+                                rawUrl.contains("format=hls", ignoreCase = true) ||
+                                rawUrl.contains("type=hls", ignoreCase = true) ||
+                                rawUrl.contains("/m3u8", ignoreCase = true)
 
                         if (isAdaptive) {
                             hasAdaptiveOnly = true
                         }
 
-                        // Strictly ensure progressive media only - never label an adaptive stream as MP4
-                        if (!isAdaptive && (format == "mp4" || format == "webm" || rawUrl.contains(".mp4", ignoreCase = true)) &&
+                        val isApiEndpoint = isApiOrManifestUrl(rawUrl)
+
+                        // Strictly ensure progressive media only - never label an adaptive stream or API endpoint as MP4
+                        if (!isAdaptive && !isApiEndpoint && (format == "mp4" || format == "webm" || rawUrl.contains(".mp4", ignoreCase = true)) &&
                             rawUrl.isNotBlank() && rawUrl.startsWith("http")
                         ) {
                             val quality = item.optString("quality", "")
@@ -498,13 +518,19 @@ class PornhubExtractor(
 
                                 val isAdaptive = format == "hls" || format == "mpd" ||
                                         rawUrl.contains(".m3u8", ignoreCase = true) ||
-                                        rawUrl.contains(".mpd", ignoreCase = true)
+                                        rawUrl.contains(".mpd", ignoreCase = true) ||
+                                        rawUrl.contains("/hls/", ignoreCase = true) ||
+                                        rawUrl.contains("format=hls", ignoreCase = true) ||
+                                        rawUrl.contains("type=hls", ignoreCase = true) ||
+                                        rawUrl.contains("/m3u8", ignoreCase = true)
 
                                 if (isAdaptive) {
                                     hasAdaptiveOnly = true
                                 }
 
-                                if (!isAdaptive && (format == "mp4" || format == "webm" || rawUrl.contains(".mp4", ignoreCase = true)) &&
+                                val isApiEndpoint = isApiOrManifestUrl(rawUrl)
+
+                                if (!isAdaptive && !isApiEndpoint && (format == "mp4" || format == "webm" || rawUrl.contains(".mp4", ignoreCase = true)) &&
                                     rawUrl.isNotBlank() && rawUrl.startsWith("http")
                                 ) {
                                     val quality = item.optString("quality", "")
@@ -545,7 +571,10 @@ class PornhubExtractor(
             var srcIndex = 0
             while (srcMatcher.find()) {
                 val directUrl = srcMatcher.group(1)?.replace("&amp;", "&") ?: continue
-                if (!directUrl.contains(".m3u8", ignoreCase = true) && !directUrl.contains(".mpd", ignoreCase = true)) {
+                if (!directUrl.contains(".m3u8", ignoreCase = true) &&
+                    !directUrl.contains(".mpd", ignoreCase = true) &&
+                    !directUrl.contains("/hls/", ignoreCase = true)
+                ) {
                     streams.add(
                         VIPMediaStream(
                             id = "ph_${viewKey}_direct_$srcIndex",
@@ -560,7 +589,6 @@ class PornhubExtractor(
                     srcIndex++
                 }
             }
-        }
         }
 
         // Deduplicate and sort descending by resolution

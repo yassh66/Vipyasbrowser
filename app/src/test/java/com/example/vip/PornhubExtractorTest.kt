@@ -586,4 +586,40 @@ class PornhubExtractorTest {
         extractorError.extract("https://www.pornhub.com/view_video.php?viewkey=ph_close_error")
         assertEquals("Response body must be closed on HTTP error", 2, closedCount)
     }
+
+    @Test
+    fun testApiAndManifestEndpointsNotClassifiedAsProgressiveMp4() {
+        val apiEndpointsHtml = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>Video Page</title></head>
+            <body>
+                <script>
+                    var flashvars_12345 = {
+                        "video_title": "Api Endpoint Video",
+                        "mediaDefinitions": [
+                            {"defaultQuality": false, "format": "mp4", "videoUrl": "https://www.pornhub.com/video/get_media?id=123", "quality": "720"},
+                            {"defaultQuality": false, "format": "mp4", "videoUrl": "https://www.pornhub.com/api/playback.json", "quality": "480"}
+                        ]
+                    };
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val result = extractor.parseHtml(apiEndpointsHtml, "ph_api_test", "https://www.pornhub.com/view_video.php?viewkey=ph_api_test")
+        assertTrue("API endpoints returning JSON must not be offered as playable MP4 streams", result is VIPExtractionResult.NoFormatsFound)
+    }
+
+    @Test
+    fun testIsApiOrManifestUrlHelper() {
+        assertTrue(PornhubExtractor.isApiOrManifestUrl("https://www.pornhub.com/video/get_media?id=456"))
+        assertTrue(PornhubExtractor.isApiOrManifestUrl("https://pornhub.com/get_media?token=abc"))
+        assertTrue(PornhubExtractor.isApiOrManifestUrl("https://pornhub.com/api/v1/source"))
+        assertTrue(PornhubExtractor.isApiOrManifestUrl("https://pornhub.com/playback.json"))
+        assertTrue(PornhubExtractor.isApiOrManifestUrl("https://pornhub.com/media?format=json"))
+
+        assertFalse(PornhubExtractor.isApiOrManifestUrl("https://cv.phncdn.com/videos/2026/720p.mp4?token=123"))
+        assertFalse(PornhubExtractor.isApiOrManifestUrl("https://cv.phncdn.com/videos/test/stream.webm"))
+    }
 }

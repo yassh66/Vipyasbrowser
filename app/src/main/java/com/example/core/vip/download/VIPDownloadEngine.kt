@@ -28,6 +28,8 @@ import java.net.URI
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Isolated, dedicated download engine for VIP media streams.
@@ -361,25 +363,47 @@ class VIPDownloadEngine(
                 return
             }
 
+            val code = finalResponse.code
+            val contentType = finalResponse.header("Content-Type")
+            val cleanType = contentType?.split(";")?.firstOrNull()?.trim()?.lowercase() ?: "unknown"
+            val finalHost = try { URI(finalResponse.request.url.toString()).host?.lowercase() ?: "unknown" } catch (_: Exception) { "unknown" }
+
             if (!finalResponse.isSuccessful) {
-                val code = finalResponse.code
+                val (receivedBytes, summary) = extractBodyDiagnostics(finalResponse)
+                val diagnosticDetails = buildString {
+                    append("HTTP $code")
+                    append(", host: $finalHost")
+                    append(", type: $cleanType")
+                    append(", received: $receivedBytes bytes")
+                    if (!summary.isNullOrBlank()) {
+                        append(", summary: $summary")
+                    }
+                }
                 cleanUpFailedTask(
                     taskId,
                     tempFile,
-                    "HTTP download failed with code $code",
+                    "HTTP download failed with code $code [$diagnosticDetails]",
                     finalResponse,
                     outputStream
                 )
                 return
             }
 
-            val contentType = finalResponse.header("Content-Type")
             if (isForbiddenContentType(contentType)) {
-                val cleanType = contentType?.split(";")?.firstOrNull()?.trim() ?: "unknown"
+                val (receivedBytes, summary) = extractBodyDiagnostics(finalResponse)
+                val diagnosticDetails = buildString {
+                    append("HTTP $code")
+                    append(", host: $finalHost")
+                    append(", type: $cleanType")
+                    append(", received: $receivedBytes bytes")
+                    if (!summary.isNullOrBlank()) {
+                        append(", summary: $summary")
+                    }
+                }
                 cleanUpFailedTask(
                     taskId,
                     tempFile,
-                    "Invalid media content type ($cleanType)",
+                    "Invalid media content type ($cleanType) [$diagnosticDetails]",
                     finalResponse,
                     outputStream
                 )
@@ -477,6 +501,28 @@ class VIPDownloadEngine(
                 return
             }
 
+            if (!tempFile.exists() || tempFile.length() == 0L) {
+                cleanUpFailedTask(
+                    taskId,
+                    tempFile,
+                    "Target file not written or empty on disk",
+                    null,
+                    null
+                )
+                return
+            }
+
+            if (tempFile.length() != totalBytesRead) {
+                cleanUpFailedTask(
+                    taskId,
+                    tempFile,
+                    "File size on disk (${tempFile.length()} bytes) does not match received bytes ($totalBytesRead bytes)",
+                    null,
+                    null
+                )
+                return
+            }
+
             // Truncation check: verify received bytes match declared Content-Length
             if (serverContentLength > 0L && totalBytesRead < serverContentLength) {
                 cleanUpFailedTask(
@@ -492,10 +538,22 @@ class VIPDownloadEngine(
             // Format-aware container signature validation before declaring COMPLETED
             val validation = VIPMediaValidator.validateMediaFile(tempFile, stream.format)
             if (validation is VIPMediaValidator.Result.Invalid) {
+                val sampleSummary = if (tempFile.exists() && tempFile.length() > 0) {
+                    try {
+                        val header = tempFile.inputStream().use { s ->
+                            val buf = ByteArray(2048)
+                            val read = s.read(buf)
+                            if (read > 0) String(buf, 0, read, Charsets.UTF_8) else ""
+                        }
+                        extractSanitizedJsonSummary(header)
+                    } catch (_: Exception) { null }
+                } else null
+
+                val extraInfo = if (!sampleSummary.isNullOrBlank()) " [summary: $sampleSummary]" else ""
                 cleanUpFailedTask(
                     taskId,
                     tempFile,
-                    "Downloaded file validation failed: ${validation.reason}",
+                    "Downloaded file validation failed: ${validation.reason}$extraInfo",
                     null,
                     null
                 )
@@ -651,18 +709,38 @@ class VIPDownloadEngine(
         if (contentTypeHeader == null) return false
         val clean = contentTypeHeader.split(";").firstOrNull()?.trim()?.lowercase() ?: return false
         return clean.startsWith("text/") ||
-                clean.startsWith("application/xhtml+xml") ||
-                clean.startsWith("application/json") ||
-                clean.startsWith("application/xml") ||
-                clean.startsWith("application/vnd.apple.mpegurl") ||
-                clean.startsWith("application/x-mpegurl") ||
-                clean.startsWith("application/dash+xml")
+                clean.contains("html") ||
+                clean.contains("json") ||
+                clean.contains("xml") ||
+                clean.contains("javascript") ||
+                clean.contains("mpegurl") ||
+                clean.contains("dash+xml")
     }
 
     private fun sanitizeErrorMessage(rawMessage: String?): String {
         if (rawMessage.isNullOrBlank()) return "Download connection error"
         // Strip sensitive URL query parameters or credential tokens
         return rawMessage.replace(Regex("(\\?|&)[^\\s'\"]+"), "")
+    }
+
+    private fun extractBodyDiagnostics(response: Response?): Pair<Long, String?> {
+        if (response == null) return Pair(0L, null)
+        return try {
+            val body = response.body ?: return Pair(0L, null)
+            val stream = body.byteStream()
+            val buf = ByteArray(2048)
+            var totalRead = 0
+            while (totalRead < buf.size) {
+                val read = stream.read(buf, totalRead, buf.size - totalRead)
+                if (read == -1) break
+                totalRead += read
+            }
+            val sampleStr = if (totalRead > 0) String(buf, 0, totalRead, Charsets.UTF_8) else ""
+            val summary = extractSanitizedJsonSummary(sampleStr)
+            Pair(totalRead.toLong(), summary)
+        } catch (_: Exception) {
+            Pair(0L, null)
+        }
     }
 
     companion object {
@@ -703,6 +781,61 @@ class VIPDownloadEngine(
             } catch (_: Exception) {
                 "[sanitized_url]"
             }
+        }
+
+        /**
+         * Safely extracts a sanitized, short error summary from a JSON string payload without logging raw secrets.
+         */
+        fun extractSanitizedJsonSummary(rawBody: String): String? {
+            if (rawBody.isBlank()) return null
+            val trimmed = rawBody.trim()
+            if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null
+
+            return try {
+                if (trimmed.startsWith("{")) {
+                    val json = JSONObject(trimmed)
+                    val candidate = when {
+                        json.has("error") -> {
+                            val err = json.opt("error")
+                            if (err is JSONObject) {
+                                err.optString("message", err.optString("detail", err.toString()))
+                            } else {
+                                err?.toString()
+                            }
+                        }
+                        json.has("message") -> json.optString("message")
+                        json.has("detail") -> json.optString("detail")
+                        json.has("reason") -> json.optString("reason")
+                        json.has("status") -> json.optString("status")
+                        json.has("code") -> json.optString("code")
+                        else -> null
+                    }
+                    if (!candidate.isNullOrBlank()) {
+                        sanitizeSummaryString(candidate)
+                    } else null
+                } else if (trimmed.startsWith("[")) {
+                    val arr = JSONArray(trimmed)
+                    if (arr.length() > 0) {
+                        val first = arr.opt(0)
+                        if (first is JSONObject) {
+                            val candidate = first.optString("error", first.optString("message", ""))
+                            if (candidate.isNotBlank()) {
+                                return sanitizeSummaryString(candidate)
+                            }
+                        }
+                        "JSON array with ${arr.length()} elements"
+                    } else null
+                } else null
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        fun sanitizeSummaryString(raw: String): String {
+            val noUrls = raw.replace(Regex("https?://[^\\s'\"]+"), "[url]")
+                .replace(Regex("(\\?|&)[^\\s'\"]+"), "")
+            val clean = noUrls.replace(Regex("[\\r\\n\\t]+"), " ").trim()
+            return if (clean.length > 80) clean.take(77) + "..." else clean
         }
     }
 }

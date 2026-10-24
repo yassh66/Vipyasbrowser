@@ -4,6 +4,7 @@ import com.example.core.vip.download.MediaStoreWriter
 import com.example.core.vip.download.VIPDownloadItem
 import com.example.core.vip.download.VIPDownloadStatus
 import com.example.core.vip.download.VIPMediaPublisher
+import com.example.core.vip.download.VIPMediaValidator
 import com.example.core.vip.download.VIPPublishResult
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -243,7 +244,7 @@ class VIPMediaPublisherTest {
         val fakeWriter = FakeMediaStoreWriter()
         val publisher = VIPMediaPublisher(fakeWriter)
 
-        val syntheticPayload = ByteArray(16 * 1024) { (it % 250).toByte() }
+        val syntheticPayload = VIPMediaValidator.createSyntheticMp4(16 * 1024)
         val sourceFile = File(tempDir, "valid_video.tmp").apply { writeBytes(syntheticPayload) }
 
         val validItem = VIPDownloadItem(
@@ -286,7 +287,7 @@ class VIPMediaPublisherTest {
         val fakeWriter = FakeMediaStoreWriter()
         val publisher = VIPMediaPublisher(fakeWriter)
 
-        val syntheticPayload = ByteArray(1024) { 42 }
+        val syntheticPayload = VIPMediaValidator.createSyntheticMp4(1024)
         val sourceFile = File(tempDir, "preserve_video.tmp").apply { writeBytes(syntheticPayload) }
 
         val validItem = VIPDownloadItem(
@@ -312,7 +313,7 @@ class VIPMediaPublisherTest {
         val fakeWriter = FakeMediaStoreWriter().apply { shouldFailOpenStream = true }
         val publisher = VIPMediaPublisher(fakeWriter)
 
-        val payload = ByteArray(2048) { 1 }
+        val payload = VIPMediaValidator.createSyntheticMp4(2048)
         val sourceFile = File(tempDir, "fail_copy.tmp").apply { writeBytes(payload) }
 
         val item = VIPDownloadItem(
@@ -341,7 +342,7 @@ class VIPMediaPublisherTest {
         val fakeWriter = FakeMediaStoreWriter().apply { shouldFailFinalize = true }
         val publisher = VIPMediaPublisher(fakeWriter)
 
-        val payload = ByteArray(2048) { 1 }
+        val payload = VIPMediaValidator.createSyntheticMp4(2048)
         val sourceFile = File(tempDir, "fail_finalize.tmp").apply { writeBytes(payload) }
 
         val item = VIPDownloadItem(
@@ -368,7 +369,7 @@ class VIPMediaPublisherTest {
         val fakeWriter = FakeMediaStoreWriter()
         val publisher = VIPMediaPublisher(fakeWriter)
 
-        val payload = ByteArray(512) { 1 }
+        val payload = VIPMediaValidator.createSyntheticMp4(512)
         val sourceFile = File(tempDir, "owned_test.tmp").apply { writeBytes(payload) }
 
         val item = VIPDownloadItem(
@@ -400,5 +401,76 @@ class VIPMediaPublisherTest {
 
         // 3. Second deletion attempt fails because it is no longer owned/tracked
         assertFalse(publisher.deletePublishedMedia(ownedUriString))
+    }
+
+    @Test
+    fun testPublisherRejectsInvalidNonMediaContainerFile() {
+        val fakeWriter = FakeMediaStoreWriter()
+        val publisher = VIPMediaPublisher(fakeWriter)
+
+        val randomGarbage = ByteArray(1024) { (it % 255).toByte() }
+        val sourceFile = File(tempDir, "invalid_container.tmp").apply { writeBytes(randomGarbage) }
+
+        val invalidItem = VIPDownloadItem(
+            id = "t_invalid",
+            mediaTitle = "Garbage Video",
+            author = "Unknown",
+            quality = "1080p",
+            format = "MP4",
+            streamUrl = "https://example.com/stream.mp4",
+            tempFile = sourceFile,
+            status = VIPDownloadStatus.COMPLETED
+        )
+
+        val result = publisher.publishMedia(invalidItem)
+        assertTrue("Must reject invalid container", result is VIPPublishResult.Failure)
+        val failure = result as VIPPublishResult.Failure
+        assertTrue(failure.reason.contains("container signature"))
+        assertTrue("No MediaStore row should be allocated", fakeWriter.insertedValues.isEmpty())
+    }
+
+    @Test
+    fun testMediaValidatorRejectsJsonPayload() {
+        val jsonFile = File(tempDir, "error.json").apply {
+            writeText("{\"error\": \"Unauthorized\", \"message\": \"Access token expired\"}")
+        }
+        val result = VIPMediaValidator.validateMediaFile(jsonFile, "MP4")
+        assertTrue(result is VIPMediaValidator.Result.Invalid)
+        assertTrue((result as VIPMediaValidator.Result.Invalid).reason.contains("JSON"))
+    }
+
+    @Test
+    fun testMediaValidatorRejectsHlsManifest() {
+        val hlsFile = File(tempDir, "manifest.m3u8").apply {
+            writeText("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nchunklist.m3u8")
+        }
+        val result = VIPMediaValidator.validateMediaFile(hlsFile, "MP4")
+        assertTrue(result is VIPMediaValidator.Result.Invalid)
+        assertTrue((result as VIPMediaValidator.Result.Invalid).reason.contains("HLS"))
+    }
+
+    @Test
+    fun testMediaValidatorRejectsCorruptFtypBox() {
+        val corruptBytes = VIPMediaValidator.createSyntheticMp4(1024)
+        // Corrupt box size to 4 (smaller than minimal 8)
+        corruptBytes[0] = 0; corruptBytes[1] = 0; corruptBytes[2] = 0; corruptBytes[3] = 4
+        val corruptFile = File(tempDir, "corrupt.mp4").apply { writeBytes(corruptBytes) }
+
+        val result = VIPMediaValidator.validateMediaFile(corruptFile, "MP4")
+        assertTrue(result is VIPMediaValidator.Result.Invalid)
+        assertTrue((result as VIPMediaValidator.Result.Invalid).reason.contains("Invalid MP4 ftyp box size"))
+    }
+
+    @Test
+    fun testMediaValidatorAcceptsValidMp4AndWebmContainers() {
+        val mp4Bytes = VIPMediaValidator.createSyntheticMp4(2048)
+        val mp4File = File(tempDir, "valid.mp4").apply { writeBytes(mp4Bytes) }
+        val mp4Result = VIPMediaValidator.validateMediaFile(mp4File, "MP4")
+        assertTrue("Valid MP4 must pass validation", mp4Result is VIPMediaValidator.Result.Valid)
+
+        val webmBytes = VIPMediaValidator.createSyntheticWebm(2048)
+        val webmFile = File(tempDir, "valid.webm").apply { writeBytes(webmBytes) }
+        val webmResult = VIPMediaValidator.validateMediaFile(webmFile, "WEBM")
+        assertTrue("Valid WebM must pass validation", webmResult is VIPMediaValidator.Result.Valid)
     }
 }
