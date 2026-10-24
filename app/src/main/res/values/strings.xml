@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">YAS Browser</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_browser">Browser</string>
+    <string name="nav_downloads">Downloads</string>
+    <string name="nav_bookmarks">Bookmarks</string>
+    <string name="nav_settings">Settings</string>
+    
+    <string name="search_hint">Search or enter web address</string>
+    <string name="download_media">Download Media</string>
+    <string name="media_extractor_title">Media Downloader</string>
+    <string name="analyze_url">Analyze URL</string>
+    <string name="analyzing">Analyzing media...</string>
+    <string name="download_video">Download Video</string>
+    <string name="download_audio">Download Audio (MP3)</string>
+    
+    <string name="err_no_formats">No playable formats or streams found for this url</string>
+    <string name="err_instagram_private">This Instagram post is private or requires login. Please open and log in through YAS Browser first.</string>
+    <string name="err_instagram_no_video">This Instagram post only contains images or photos. No video streams found.</string>
+    <string name="err_instagram_login_required">Instagram requires authentication for this content. Log in via browser first.</string>
+    <string name="err_invalid_url">Please enter a valid URL.</string>
+    
+    <string name="format_video_tab">Video</string>
+    <string name="format_audio_tab">Audio</string>
+    <string name="active_downloads">Active Downloads</string>
+    <string name="no_downloads">No active downloads</string>
+</resources>

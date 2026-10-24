@@ -1,0 +1,8 @@
+{
+  "name": "YAS Browser",
+  "description": "Fast, private browser with built-in media downloader, Instagram video extraction, and smart immersive browsing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
